@@ -13,7 +13,7 @@ reproduce the key behavioural features:
   - Partial payments at irregular intervals until settlement
   - Case estimates set at reporting and revised upward or downward over time
   - Settlement timing follows a parametric survival model
-  - Optional reopenings after settlement
+  - Optional reopenings after settlement (with corrected trajectory mechanics)
   - Three claim types with distinct severity and development profiles
 
 Design choices
@@ -26,15 +26,20 @@ The log-normal severity with mixture is chosen because:
   - It produces the heavy right tail that makes reserving hard
   - The claim type mixture creates heterogeneous inflation profiles
   - It matches what SPLICE and SynthETIC use in their simulations
+
+Key invariants maintained throughout:
+  - cumulative_paid is non-decreasing within a claim
+  - cumulative_paid <= ultimate at every development quarter
+  - For settled claims at last observation: cumulative_paid == ultimate
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Optional
 import numpy as np
 import polars as pl
-from datetime import date, timedelta
+from datetime import date
 
 
 @dataclass
@@ -45,14 +50,14 @@ class SeverityConfig:
     log_mean and log_std are the mean and std of log(ultimate),
     not the mean and std of ultimate itself.
     """
-    log_mean: float = 8.0        # exp(8) ≈ 3000 — typical BI attritional
+    log_mean: float = 8.0
     log_std: float = 1.2
-    settlement_rate: float = 0.3  # fraction of claims settling per quarter
-    payment_frequency: float = 0.6  # probability of a payment in any open quarter
-    case_revision_freq: float = 0.4  # probability of a case revision per open quarter
+    settlement_rate: float = 0.3
+    payment_frequency: float = 0.6
+    case_revision_freq: float = 0.4
     large_loss_threshold: float = 50_000.0
-    large_loss_prob: float = 0.05     # mixing weight for large loss component
-    large_log_mean: float = 11.0      # exp(11) ≈ 60,000
+    large_loss_prob: float = 0.05
+    large_log_mean: float = 11.0
     large_log_std: float = 0.8
 
 
@@ -143,12 +148,9 @@ class SyntheticClaimsGenerator:
         Returns
         -------
         pl.DataFrame
-            Panel with columns:
-            claim_id, accident_date, valuation_date, claim_type,
-            cumulative_paid, case_estimate, is_open, ultimate,
-            n_case_revisions, case_estimate_mean, case_estimate_std,
-            case_estimate_trend, largest_case_revision, prop_upward_revisions,
-            feat_claim_type (int encoding), feat_litigation, feat_fault, split
+            Panel with one row per claim per valuation quarter. Columns include
+            all required schema columns plus case estimate history summaries,
+            feat_* covariates, and a train/test split indicator.
         """
         claims = self._generate_claims()
         rows = self._expand_to_panel(claims)
@@ -157,61 +159,54 @@ class SyntheticClaimsGenerator:
         return df
 
     def _generate_claims(self) -> list[dict]:
-        """
-        Generate one dict per claim with its full trajectory.
-        """
         base_date = date(2020, 1, 1)
         claims = []
 
         for i in range(self.n_claims):
             claim_type = self._rng.choice(CLAIM_TYPE_NAMES, p=CLAIM_TYPE_PROBS)
             cfg = CLAIM_TYPE_CONFIGS[claim_type]
+            eff_settlement_rate = (
+                self.settlement_rate if self.settlement_rate is not None
+                else cfg.settlement_rate
+            )
 
-            # Override settlement rate if set globally
-            eff_settlement_rate = self.settlement_rate if self.settlement_rate is not None else cfg.settlement_rate
-
-            # Accident quarter: spread over n_periods
             accident_quarter = int(self._rng.integers(0, self.n_periods))
             accident_date = self._quarter_to_date(base_date, accident_quarter)
 
-            # Reporting delay: 0-3 quarters (longer for BI)
             if claim_type == "bodily_injury":
                 report_delay_quarters = int(self._rng.integers(1, 4))
             else:
                 report_delay_quarters = int(self._rng.integers(0, 2))
 
-            reporting_date = self._quarter_to_date(base_date, accident_quarter + report_delay_quarters)
+            reporting_date = self._quarter_to_date(
+                base_date, accident_quarter + report_delay_quarters
+            )
 
-            # Draw ultimate from log-normal (possibly large loss)
+            # Draw initial ultimate from log-normal (possibly large loss)
             is_large = self._rng.random() < cfg.large_loss_prob
             if is_large:
                 if self.severity_distribution == "pareto":
-                    alpha = 2.0
-                    x_m = np.exp(cfg.large_log_mean - 1.0 / alpha)
-                    ultimate = float(x_m * (1.0 / self._rng.random()) ** (1.0 / alpha))
+                    alpha, x_m = 2.0, np.exp(cfg.large_log_mean - 1.0 / 2.0)
+                    initial_ultimate = float(x_m * (1.0 / self._rng.random()) ** (1.0 / alpha))
                 else:
-                    ultimate = float(self._rng.lognormal(cfg.large_log_mean, cfg.large_log_std))
+                    initial_ultimate = float(self._rng.lognormal(cfg.large_log_mean, cfg.large_log_std))
             else:
                 if self.severity_distribution == "pareto":
-                    alpha = 3.0
-                    x_m = np.exp(cfg.log_mean - 1.0 / alpha)
-                    ultimate = float(x_m * (1.0 / self._rng.random()) ** (1.0 / alpha))
+                    alpha, x_m = 3.0, np.exp(cfg.log_mean - 1.0 / 3.0)
+                    initial_ultimate = float(x_m * (1.0 / self._rng.random()) ** (1.0 / alpha))
                 else:
-                    ultimate = float(self._rng.lognormal(cfg.log_mean, cfg.log_std))
+                    initial_ultimate = float(self._rng.lognormal(cfg.log_mean, cfg.log_std))
 
-            # Covariates
             litigation = int(self._rng.random() < (0.40 if claim_type == "bodily_injury" else 0.15))
-            fault = float(np.clip(self._rng.beta(2, 3), 0.0, 1.0))  # most claims fault ~0.4
+            fault = float(np.clip(self._rng.beta(2, 3), 0.0, 1.0))
 
-            # Simulate development trajectory
-            trajectory = self._simulate_trajectory(
-                ultimate=ultimate,
+            trajectory, final_ultimate = self._simulate_trajectory(
+                initial_ultimate=initial_ultimate,
                 cfg=cfg,
                 eff_settlement_rate=eff_settlement_rate,
                 accident_quarter=accident_quarter,
                 report_delay_quarters=report_delay_quarters,
                 base_date=base_date,
-                claim_type=claim_type,
             )
 
             claims.append({
@@ -219,7 +214,7 @@ class SyntheticClaimsGenerator:
                 "accident_date": accident_date,
                 "reporting_date": reporting_date,
                 "claim_type": claim_type,
-                "ultimate": ultimate,
+                "ultimate": final_ultimate,
                 "litigation": litigation,
                 "fault": fault,
                 "trajectory": trajectory,
@@ -229,75 +224,78 @@ class SyntheticClaimsGenerator:
 
     def _simulate_trajectory(
         self,
-        ultimate: float,
+        initial_ultimate: float,
         cfg: SeverityConfig,
         eff_settlement_rate: float,
         accident_quarter: int,
         report_delay_quarters: int,
         base_date: date,
-        claim_type: str,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], float]:
         """
         Simulate quarter-by-quarter development for a single claim.
 
-        Returns a list of dicts, one per development quarter from reporting
-        until settlement (or max_dev_quarters, whichever comes first).
+        Invariants maintained:
+        - cumulative_paid is non-decreasing at every step
+        - cumulative_paid <= current_ultimate at every step
+        - At settlement: cumulative_paid == current_ultimate
+        - Reopening: current_ultimate increases; cumulative_paid stays non-decreasing
+
+        Returns
+        -------
+        rows : list[dict]
+            One dict per development quarter. Rows store the local state;
+            the 'ultimate' field reflects the current_ultimate at THAT point,
+            which may differ if reopening occurs.
+        final_ultimate : float
+            The ultimate at the end of development (used for claim-level storage).
         """
         first_dev = accident_quarter + report_delay_quarters
         cumulative_paid = 0.0
+        current_ultimate = initial_ultimate
 
-        # Initial case estimate: set at reporting, typically 60-120% of ultimate
-        # with noise — case estimators don't know the answer yet
-        initial_ce_factor = self._rng.lognormal(0.0, 0.3)  # median = ultimate, noisy
-        initial_case_estimate = float(ultimate * initial_ce_factor)
-
+        initial_ce_factor = self._rng.lognormal(0.0, 0.3)
+        initial_case_estimate = float(current_ultimate * initial_ce_factor)
         case_estimates_history = [initial_case_estimate]
-        cumulative_paid_history = [0.0]
 
         is_open = True
+        # Incremental per-quarter inflation factor
         quarterly_inflation = (1.0 + self.inflation_rate) ** 0.25
 
         rows = []
-        dev_q = 0
 
         for dev_q in range(self.max_dev_quarters):
             abs_quarter = first_dev + dev_q
             val_date = self._quarter_to_date(base_date, abs_quarter)
 
-            remaining = ultimate - cumulative_paid
-
-            # Payment this quarter?
-            if is_open and self._rng.random() < cfg.payment_frequency:
-                # Payment is a fraction of remaining — beta distributed
+            # Payment this quarter (only if open and something remains)
+            remaining = current_ultimate - cumulative_paid
+            if is_open and remaining > 0 and self._rng.random() < cfg.payment_frequency:
+                # Fraction of remaining — beta distributed (right-skewed, most payments small)
                 pay_frac = self._rng.beta(1.5, 4.0)
-                payment = float(remaining * pay_frac)
-                # Apply calendar-year inflation
-                inflation_factor = quarterly_inflation ** abs_quarter
-                payment *= inflation_factor
+                # Apply incremental inflation boost to this quarter's payment
+                payment = float(remaining * pay_frac * quarterly_inflation)
+                # Hard cap: never exceed remaining
                 payment = min(payment, remaining)
-                cumulative_paid = min(cumulative_paid + payment, ultimate)
+                cumulative_paid = cumulative_paid + payment
+                # Guarantee invariant
+                cumulative_paid = min(cumulative_paid, current_ultimate)
 
-            # Case estimate revision?
+            # Case estimate revision
             current_ce = case_estimates_history[-1]
             if is_open and self._rng.random() < cfg.case_revision_freq:
-                remaining_after_payment = ultimate - cumulative_paid
-                # Revise toward remaining (with noise)
+                remaining_now = max(0.0, current_ultimate - cumulative_paid)
                 revision_factor = self._rng.lognormal(0.0, 0.25)
-                new_ce = float(remaining_after_payment * revision_factor)
-                new_ce = max(new_ce, 0.0)
+                new_ce = float(remaining_now * revision_factor)
                 case_estimates_history.append(new_ce)
             else:
                 case_estimates_history.append(current_ce)
 
-            cumulative_paid_history.append(cumulative_paid)
-
-            # Compute case estimate summary statistics
+            # Summary statistics for case estimate history
             ces = np.array(case_estimates_history)
             revisions = np.diff(ces)
             n_revisions = len(revisions)
 
             if len(ces) >= 2 and np.std(ces) > 0:
-                # Simple linear trend: regress CE index on dev quarter
                 x = np.arange(len(ces), dtype=float)
                 ce_trend = float(np.polyfit(x, ces, 1)[0])
             else:
@@ -305,11 +303,19 @@ class SyntheticClaimsGenerator:
 
             upward = float(np.sum(revisions > 0)) / max(1, n_revisions)
 
+            # Settlement: does claim close this quarter?
+            settle_this_quarter = is_open and self._rng.random() < eff_settlement_rate
+            if settle_this_quarter:
+                # Final payment brings paid to ultimate
+                cumulative_paid = current_ultimate
+                is_open = False
+
             rows.append({
                 "valuation_date": val_date,
                 "cumulative_paid": float(cumulative_paid),
                 "case_estimate": float(case_estimates_history[-1]),
                 "is_open": bool(is_open),
+                "row_ultimate": float(current_ultimate),  # local ultimate for this row
                 "n_case_revisions": n_revisions,
                 "case_estimate_mean": float(np.mean(ces)),
                 "case_estimate_std": float(np.std(ces)) if len(ces) > 1 else 0.0,
@@ -318,27 +324,27 @@ class SyntheticClaimsGenerator:
                 "prop_upward_revisions": upward,
             })
 
-            # Settlement: does claim close this quarter?
-            if is_open and self._rng.random() < eff_settlement_rate:
-                # Settle: final payment brings to ultimate
-                cumulative_paid = ultimate
-                is_open = False
-                # Update last row
-                rows[-1]["cumulative_paid"] = float(ultimate)
-                rows[-1]["is_open"] = False
-
-            # Possible reopening (rare)
-            if not is_open and self._rng.random() < self.reopen_prob and dev_q < self.max_dev_quarters - 2:
-                extra = float(ultimate * self._rng.beta(0.5, 5.0) * 0.1)
-                ultimate += extra
-                cumulative_paid = float(ultimate * 0.9)
+            # Possible reopening after settlement (IBNR re-emergence)
+            # Only reopen if we just settled and there are more quarters available
+            if (not is_open
+                    and dev_q < self.max_dev_quarters - 2
+                    and self._rng.random() < self.reopen_prob):
+                # Extra liability discovered: add to ultimate (never reduce paid)
+                extra = float(current_ultimate * self._rng.beta(0.5, 5.0) * 0.1)
+                current_ultimate += extra
                 is_open = True
+                # Update last row to reflect reopening state
+                rows[-1]["is_open"] = True
+                rows[-1]["row_ultimate"] = float(current_ultimate)
 
-        return rows
+        return rows, current_ultimate
 
     def _expand_to_panel(self, claims: list[dict]) -> list[dict]:
         """
         Flatten claim trajectories into panel rows.
+
+        We use the per-row ultimate (row_ultimate) to populate the
+        ultimate column, so that at every point in time cumulative_paid <= ultimate.
         """
         panel = []
         for claim in claims:
@@ -351,7 +357,8 @@ class SyntheticClaimsGenerator:
                     "cumulative_paid": row["cumulative_paid"],
                     "case_estimate": row["case_estimate"],
                     "is_open": row["is_open"],
-                    "ultimate": claim["ultimate"],
+                    # Use the row-level ultimate (reflects any reopening at that point)
+                    "ultimate": row["row_ultimate"],
                     "n_case_revisions": row["n_case_revisions"],
                     "case_estimate_mean": row["case_estimate_mean"],
                     "case_estimate_std": row["case_estimate_std"],
@@ -365,11 +372,7 @@ class SyntheticClaimsGenerator:
         return panel
 
     def _add_split(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Assign train/test splits by claim_id (not by row) to avoid leakage.
-
-        All rows for a given claim go into the same split.
-        """
+        """Assign train/test splits by claim_id (all rows for a claim go to same split)."""
         unique_claims = df["claim_id"].unique().to_list()
         rng = np.random.default_rng(self.random_state)
         rng.shuffle(unique_claims)

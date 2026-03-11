@@ -198,18 +198,20 @@ class FNNReserver:
         # Prepare features
         df = prepare_features(df, use_case_estimates=self.use_case_estimates)
 
-        # Training data: only settled claims with positive outstanding
+        # Training data: all rows where the eventual ultimate is known and
+        # outstanding > 0. This includes open claims at intermediate quarters of
+        # eventually-settled claims, not just the final settled row.
+        # The key invariant: ultimate > cumulative_paid (positive outstanding to predict).
         settled = df.filter(
-            (pl.col("is_open") == False)
-            & (pl.col("ultimate").is_not_null())
+            pl.col("ultimate").is_not_null()
             & (pl.col("ultimate") > pl.col("cumulative_paid"))
         )
 
         if len(settled) < 100:
             raise ValueError(
-                f"Only {len(settled)} settled claims found in training data. "
-                "FNNReserver needs at least 100 settled observations. "
-                "Check that is_open=False rows have non-null ultimate values."
+                f"Only {len(settled)} training observations with positive outstanding found. "
+                "FNNReserver needs at least 100 observations. "
+                "Ensure your training data has ultimate values and claims with positive outstanding."
             )
 
         self._feature_cols = get_feature_columns(settled, self.use_case_estimates)
@@ -545,10 +547,11 @@ class LSTMReserver:
         for cid in claim_ids:
             claim_df = df.filter(pl.col("claim_id") == cid).sort("dev_quarter")
 
-            # Skip if no settled observation at end
+            # In fit_mode: target = outstanding at last observed quarter.
+            # The outer query guarantees ultimate > cumulative_paid at last row.
             if fit_mode:
                 last_row = claim_df.tail(1)
-                if last_row["is_open"][0] or last_row["ultimate"].is_null()[0]:
+                if last_row["ultimate"].is_null()[0]:
                     continue
                 outstanding = float(last_row["ultimate"][0]) - float(last_row["cumulative_paid"][0])
                 if outstanding <= 0:
@@ -586,18 +589,28 @@ class LSTMReserver:
             torch.manual_seed(self.random_state)
             np.random.seed(self.random_state)
 
-        # Use only settled claims for training
-        settled_df = df.filter(
-            (pl.col("is_open") == False)
-            & (pl.col("ultimate").is_not_null())
+        # For LSTM training, use all claims that eventually settled.
+        # Prepare features first so dev_quarter is available for sorting.
+        df = prepare_features(df, use_case_estimates=False)
+
+        settled_claim_ids = (
+            df.sort("dev_quarter")
+            .group_by("claim_id")
+            .last()
+            .filter(
+                pl.col("ultimate").is_not_null()
+                & (pl.col("ultimate") > pl.col("cumulative_paid"))
+            )["claim_id"]
+            .to_list()
         )
+        settled_df = df.filter(pl.col("claim_id").is_in(settled_claim_ids))
 
         sequences, static_feats, y = self._build_sequences(settled_df, fit_mode=True)
 
         if len(sequences) < 50:
             raise ValueError(
-                f"Only {len(sequences)} usable settled claim sequences found. "
-                "LSTMReserver needs at least 50."
+                f"Only {len(sequences)} usable claim sequences found. "
+                "LSTMReserver needs at least 50 claims with known ultimate > paid."
             )
 
         n_seq = sequences[0].shape[1]

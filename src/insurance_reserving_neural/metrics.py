@@ -188,7 +188,9 @@ def reserve_range(
     }
 
     for p in percentiles:
-        key = f"P{str(p).replace('.', '_')}"
+        # Format: P10, P50, P99_5 (whole numbers lose the .0)
+        p_str = str(int(p)) if p == int(p) else str(p).replace(".", "_")
+        key = f"P{p_str}"
         result[key] = float(np.percentile(boot_totals, p))
 
     return result
@@ -290,8 +292,10 @@ def chain_ladder_reserve(
         col_j = triangle[:, j]
         col_j1 = triangle[:, j + 1]
         mask = np.isfinite(col_j) & np.isfinite(col_j1)
-        if mask.sum() >= 1:
+        if mask.sum() >= 1 and col_j[mask].sum() > 0:
             factor = col_j1[mask].sum() / col_j[mask].sum()
+            # Floor at 1.0: cumulative paid should not decrease in aggregate
+            factor = max(1.0, factor)
         else:
             factor = 1.0
         dev_factors.append(float(factor))

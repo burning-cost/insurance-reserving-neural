@@ -115,10 +115,15 @@ class TestFNNReserverFit:
         assert model._is_fitted
 
     def test_insufficient_data_raises(self):
-        gen = SyntheticClaimsGenerator(n_claims=5, settlement_rate=0.0, random_state=0)
+        # With n_claims=1 and settlement_rate=0, claim never settles
+        # so ultimate > cumulative_paid for at most ~20 rows — below 100 threshold
+        # Use n_claims=2, max_dev_quarters=3: at most 6 rows, well below 100
+        gen = SyntheticClaimsGenerator(
+            n_claims=2, max_dev_quarters=3, settlement_rate=0.0, random_state=0
+        )
         df = gen.generate()
         model = FNNReserver(max_epochs=3)
-        with pytest.raises(ValueError, match="settled"):
+        with pytest.raises(ValueError):
             model.fit(df)
 
     def test_unfitted_predict_raises(self, test_df):

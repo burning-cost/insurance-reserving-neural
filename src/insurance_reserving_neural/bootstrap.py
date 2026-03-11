@@ -102,11 +102,12 @@ class BootstrapReserver:
         # Fit base model
         self.base_model.fit(df)
 
-        # Compute training residuals on settled claims in log space
+        # Compute training residuals on all rows with positive outstanding.
+        # This matches the training filter used by FNNReserver and ensures
+        # we have enough residuals to bootstrap from.
         settled = df.filter(
-            (pl.col("is_open") == False)
-            & (pl.col("ultimate").is_not_null())
-            & ((pl.col("ultimate") - pl.col("cumulative_paid")) > 0)
+            pl.col("ultimate").is_not_null()
+            & (pl.col("ultimate") > pl.col("cumulative_paid"))
         )
 
         preds = self.base_model.predict(settled)
@@ -191,7 +192,8 @@ class BootstrapReserver:
         }
 
         for p in self.percentiles:
-            key = f"P{str(p).replace('.', '_')}"
+            p_str = str(int(p)) if p == int(p) else str(p).replace(".", "_")
+            key = f"P{p_str}"
             result[key] = float(np.percentile(boot_reserves, p))
 
         return result
@@ -208,14 +210,22 @@ class BootstrapReserver:
             raise RuntimeError("Call fit() first.")
 
         r = self._residuals
-        _, norm_p = stats.normaltest(r)
+        if len(r) < 8:
+            # scipy normaltest requires at least 8 samples
+            norm_p = float("nan")
+        else:
+            try:
+                _, norm_p = stats.normaltest(r)
+                norm_p = float(norm_p)
+            except Exception:
+                norm_p = float("nan")
 
         return {
             "n_residuals": int(len(r)),
-            "mean": float(np.mean(r)),
-            "std": float(np.std(r)),
-            "skewness": float(stats.skew(r)),
-            "kurtosis": float(stats.kurtosis(r)),
-            "normality_p_value": float(norm_p),
-            "is_normal_at_5pct": bool(norm_p > 0.05),
+            "mean": float(np.mean(r)) if len(r) > 0 else float("nan"),
+            "std": float(np.std(r)) if len(r) > 0 else float("nan"),
+            "skewness": float(stats.skew(r)) if len(r) > 1 else float("nan"),
+            "kurtosis": float(stats.kurtosis(r)) if len(r) > 3 else float("nan"),
+            "normality_p_value": norm_p,
+            "is_normal_at_5pct": bool(norm_p > 0.05) if not np.isnan(norm_p) else False,
         }
